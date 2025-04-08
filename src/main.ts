@@ -91,39 +91,64 @@ async function getPRDetails(): Promise<PRDetails> {
  */
 async function getDiffContent(prDetails: PRDetails, eventData: any): Promise<string | null> {
   let diff: string | null = null;
-  if (eventData.action === "opened" || eventData.action === "reopened" || !eventData.before || !eventData.after) {
-    core.info("Fetching full PR diff for 'opened'/'reopened' event or missing commit info.");
-    try {
-      const response = await octokit.pulls.get({
-        owner: prDetails.owner,
-        repo: prDetails.repo,
-        pull_number: prDetails.pull_number,
-        mediaType: { format: "diff" },
-      });
-      diff = response.data as unknown as string;
-    } catch (error) {
-      core.error(`Error fetching full PR diff: ${error}`);
-    }
-  } else if (eventData.action === "synchronize") {
-    core.info("Fetching diff between commits for 'synchronize' event.");
-    const baseSha = eventData.before;
-    const headSha = eventData.after;
-    core.info(`Comparing base ${baseSha} to head ${headSha}`);
-    try {
-      const response = await octokit.repos.compareCommits({
-        headers: { accept: "application/vnd.github.v3.diff" },
-        owner: prDetails.owner,
-        repo: prDetails.repo,
-        base: baseSha,
-        head: headSha,
-      });
-      diff = String(response.data);
-    } catch (error) {
-      core.error(`Error comparing commits: ${error}`);
-    }
-  } else {
-    core.warning(`Unsupported event action: '${eventData.action}'. Cannot determine diff.`);
-  }
+  // Handle 'pull_request' events (opened, reopened, synchronize)
+  if (eventData.pull_request) {
+     const pull_number = eventData.pull_request.number;
+     if (eventData.action === "opened" || eventData.action === "reopened") {
+         core.info(`Workspaceing full PR diff for 'opened'/'reopened' event (PR #${pull_number}).`);
+         try {
+            const response = await octokit.pulls.get({
+                owner: prDetails.owner,
+                repo: prDetails.repo,
+                pull_number: pull_number,
+                mediaType: { format: "diff" },
+            });
+            diff = response.data as unknown as string;
+         } catch (error) {
+            core.error(`Error fetching full PR diff: ${error}`);
+         }
+     } else if (eventData.action === "synchronize") {
+        core.info(`Workspaceing diff between commits for 'synchronize' event (PR #${pull_number}).`);
+        const baseSha = eventData.before;
+        const headSha = eventData.after;
+        if (!baseSha || !headSha) {
+            core.error("Could not determine base or head SHA for 'synchronize' event.");
+        } else {
+            core.info(`Comparing base ${baseSha} to head ${headSha}`);
+            try {
+                const response = await octokit.repos.compareCommits({
+                headers: { accept: "application/vnd.github.v3.diff" },
+                owner: prDetails.owner,
+                repo: prDetails.repo,
+                base: baseSha,
+                head: headSha,
+                });
+                diff = String(response.data);
+            } catch (error) {
+                core.error(`Error comparing commits: ${error}`);
+            }
+        }
+     } else {
+        core.warning(`Unsupported pull_request event action: '${eventData.action}'. Cannot determine diff.`);
+     }
+  } else {
+     // Fallback or handle other event types if necessary (e.g., push)
+     core.warning(`Event is not a pull_request event. Diff fetching might be inaccurate or skipped.`);
+     // Optionally try fetching full PR diff if prDetails are available anyway
+     // (May not be the correct diff for other event types)
+      try {
+         core.info(`Attempting to fetch full PR diff as fallback for PR #${prDetails.pull_number}`);
+         const response = await octokit.pulls.get({
+             owner: prDetails.owner,
+             repo: prDetails.repo,
+             pull_number: prDetails.pull_number,
+             mediaType: { format: "diff" },
+         });
+         diff = response.data as unknown as string;
+      } catch (error) {
+         core.error(`Error fetching full PR diff as fallback: ${error}`);
+      }
+  }
   return diff;
 }
 
@@ -151,18 +176,14 @@ async function getFileContent(
                 return Buffer.from(response.data.content, 'base64').toString('utf8');
             } else {
                 core.warning(`Unexpected or missing encoding for file ${filePath}. Assuming UTF-8.`);
-                // Attempt to return content directly if not base64
-                 // Ensure content exists before trying Buffer.from
                  if (response.data.content) {
-                    // Try decoding assuming it might be base64 anyway, or return as is
                     try {
                        return Buffer.from(response.data.content, 'base64').toString('utf8');
                     } catch (e) {
-                       // If not base64 or error, return raw content if it's a string
                        return typeof response.data.content === 'string' ? response.data.content : null;
                     }
                  } else {
-                     return null; // No content property
+                     return null;
                  }
             }
         } else if (typeof response.data === 'object' && response.data && 'type' in response.data && response.data.type !== 'file') {
@@ -172,7 +193,7 @@ async function getFileContent(
         } else {
             core.warning(`Could not retrieve content for file ${filePath}. Response data might be missing expected properties or was not a file.`);
         }
-        return null; // Return null if not a file or content is missing/unexpected
+        return null;
     } catch (error: any) {
         if (error.status === 404) {
              core.warning(`File ${filePath} not found at SHA ${sha}. It might have been deleted or renamed.`);
@@ -193,12 +214,10 @@ async function analyzeCode(
   const allComments: ReviewComment[] = [];
 
   for (const file of parsedDiff) {
-    // Skip deleted files, binary files, or files without a destination path
     if (file.to === "/dev/null" || !file.to || file.binary) {
       core.info(`Skipping deleted, binary, or invalid file entry: ${file.from ?? file.to ?? 'unknown'}`);
       continue;
     }
-    // Skip files matching exclude patterns
     const filePath = file.to;
     if (excludePatterns.some(pattern => minimatch(filePath, pattern))) {
         core.info(`Excluding file ${filePath} due to pattern match.`);
@@ -226,23 +245,23 @@ async function analyzeCode(
        continue;
     }
 
-    // Use a Set to keep track of chunks processed for this file to avoid duplicate analysis if chunk logic changes
     const processedChunkContent = new Set<string>();
 
     for (const chunk of file.chunks) {
-        // Avoid reprocessing identical chunks if parse-diff produces overlaps (unlikely but possible)
         if (processedChunkContent.has(chunk.content)) continue;
         processedChunkContent.add(chunk.content);
 
       const prompt = createPrompt(file, chunk, prDetails, fullFileContent);
+      // Log the prompt being sent (optional, can be verbose)
+      core.debug(`Prompt for chunk in ${filePath}:\n${prompt}`);
+
       const aiResponse = await getAIResponse(prompt);
 
       if (aiResponse) {
-        // --- Format and VALIDATE Comments ---
-        // Pass the chunk details for validation against the diff
-        const validComments = createComment(file, chunk, aiResponse); // Removed fullFileContent as it's not needed for validation here
+          core.debug(`Raw AI Response for chunk in ${filePath}: ${JSON.stringify(aiResponse)}`);
+        const validComments = createComment(file, chunk, aiResponse);
         if (validComments.length > 0) {
-          core.info(`Found ${validComments.length} valid comments for chunk in ${filePath}`);
+          // Info log moved to createComment for more context
           allComments.push(...validComments);
         }
       }
@@ -258,10 +277,9 @@ function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails, fullFileCo
   const diffSnippet = `
 ${chunk.content}
 ${chunk.changes
-    .map((c: Change) => `${c.ln ?? c.ln2 ?? ''} ${c.content}`) // Use Change type, handle potentially missing line numbers
+    .map((c: Change) => `${c.ln ?? c.ln2 ?? ''} ${c.content}`)
     .join("\n")}
 `;
-  // Determine file extension for syntax highlighting hint
   const fileExtension = file.to?.split('.').pop() || '';
 
   return `Your task is to review pull requests based on the provided context.
@@ -304,7 +322,7 @@ async function getAIResponse(prompt: string): Promise<AIResponseItem[] | null> {
     const queryConfig = {
         model: OPENAI_API_MODEL,
         temperature: 0.2,
-        max_tokens: 1000, // Adjust as needed
+        max_tokens: 1000,
         top_p: 1,
         frequency_penalty: 0,
         presence_penalty: 0,
@@ -313,7 +331,7 @@ async function getAIResponse(prompt: string): Promise<AIResponseItem[] | null> {
     try {
         const supportsJsonFormat = [
             "gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview",
-            "gpt-4-turbo", "gpt-3.5-turbo-1106", "gpt-3.5-turbo-0125", "gpt-3.5-turbo" // Add latest 3.5 alias
+            "gpt-4-turbo", "gpt-3.5-turbo-1106", "gpt-3.5-turbo-0125", "gpt-3.5-turbo"
         ].includes(OPENAI_API_MODEL);
 
         const response = await openai.chat.completions.create({
@@ -330,6 +348,9 @@ async function getAIResponse(prompt: string): Promise<AIResponseItem[] | null> {
             return null;
         }
 
+        // Log the raw response from AI for debugging
+        core.debug(`Raw AI response content:\n${rawResponse}`);
+
         try {
             const jsonMatch = rawResponse.match(/```json\s*([\s\S]*?)\s*```/);
             const jsonString = jsonMatch ? jsonMatch[1] : rawResponse;
@@ -338,15 +359,13 @@ async function getAIResponse(prompt: string): Promise<AIResponseItem[] | null> {
             if (parsedResponse && Array.isArray(parsedResponse.reviews)) {
                 const validReviews: AIResponseItem[] = [];
                 for (const review of parsedResponse.reviews) {
-                     // Validate review structure more carefully
                     if (review &&
                         (typeof review.lineNumber === 'string' || typeof review.lineNumber === 'number') &&
-                        (String(review.lineNumber)).trim() !== '' && // Check non-empty after converting to string
+                        (String(review.lineNumber)).trim() !== '' &&
                         typeof review.reviewComment === 'string' &&
                         review.reviewComment.trim() !== '')
                     {
                         validReviews.push({
-                            // Ensure lineNumber is stored as string internally before validation phase
                             lineNumber: String(review.lineNumber).trim(),
                             reviewComment: review.reviewComment
                         });
@@ -385,50 +404,55 @@ function createComment(
     }
     const filePath = file.to;
 
-    // --- New Validation Logic ---
-    // Create a set of line numbers that were actually added in this chunk (in the new file).
+    // --- Validation Logic ---
     const addedLineNumbersInChunk = new Set<number>();
     for (const change of chunk.changes) {
-        // Ensure 'add' is true and 'ln' (new line number) is present
         if (change.add && typeof change.ln === 'number') {
             addedLineNumbersInChunk.add(change.ln);
         }
     }
-    // --- End New Validation Logic ---
+    // --- End Validation Logic ---
 
-    if (addedLineNumbersInChunk.size === 0) {
-        // If no lines were added in this chunk, AI comments targeting specific lines are likely invalid for posting
-        // Log if AI still provided comments for this chunk
-        if (aiResponses.length > 0) {
-           core.info(`Chunk in ${filePath} had no added lines, but AI provided ${aiResponses.length} suggestions. Discarding line-specific comments for this chunk.`);
-           aiResponses.forEach(resp => core.debug(`Discarded AI comment for ${filePath} line ${resp.lineNumber}: ${resp.reviewComment.substring(0, 50)}...`));
-        }
-        return []; // No valid lines to comment on in this chunk
+    // Log the chunk details for debugging validation
+    core.debug(`Processing Chunk for ${filePath}. Content: ${chunk.content}`);
+    core.debug(`Added lines identified in this chunk: ${JSON.stringify(Array.from(addedLineNumbersInChunk))}`);
+
+    if (addedLineNumbersInChunk.size === 0 && aiResponses.length > 0) {
+       core.info(`Chunk in ${filePath} had no added lines, but AI provided ${aiResponses.length} suggestions. Discarding line-specific comments for this chunk.`);
+       aiResponses.forEach(resp => core.debug(`Discarded AI comment for ${filePath} line ${resp.lineNumber}: ${resp.reviewComment.substring(0, 50)}...`));
+       return [];
     }
 
 
-    return aiResponses.flatMap((aiResponse): ReviewComment[] => { // Return ReviewComment[] for flatMap
+    return aiResponses.flatMap((aiResponse): ReviewComment[] => {
         const lineNumber = parseInt(aiResponse.lineNumber, 10);
 
-        // Basic validation for the parsed line number
         if (isNaN(lineNumber) || lineNumber <= 0) {
             core.warning(`Invalid line number format '${aiResponse.lineNumber}' received from AI for file ${filePath}. Skipping comment: "${aiResponse.reviewComment.substring(0, 50)}..."`);
-            return []; // Discard comment
+            return [];
         }
 
         // --- Check if the AI's suggested line number is in the set of added lines for this chunk ---
         if (addedLineNumbersInChunk.has(lineNumber)) {
-            // VALID: The line number corresponds to an added line in this diff chunk.
-             core.debug(`Validated comment for ${filePath} line ${lineNumber}.`);
+            // --- START Enhanced Logging ---
+            core.info(`✔️ VALIDATING COMMENT for ${filePath} line ${lineNumber}`); // Use info level for visibility
+            core.debug(`   AI Response: ${JSON.stringify(aiResponse)}`);
+            core.debug(`   Added Lines in Chunk: ${JSON.stringify(Array.from(addedLineNumbersInChunk))}`);
+            // Find and log the specific change object from the diff that matched
+            const matchingChange = chunk.changes.find(c => c.add && c.ln === lineNumber);
+            core.debug(`   Matching Diff Line Data: ${JSON.stringify(matchingChange)}`);
+            // --- END Enhanced Logging ---
             return [{ // Return array with single valid comment
                 body: aiResponse.reviewComment,
                 path: filePath,
                 line: lineNumber,
             }];
         } else {
-            // INVALID: The AI commented on a line number that wasn't added in this specific chunk.
-            core.info(`Discarding AI comment for ${filePath} line ${lineNumber} because it does not correspond to an added line in the processed diff chunk.`);
-            core.debug(`Discarded comment content: ${aiResponse.reviewComment.substring(0, 100)}...`);
+            // --- START Enhanced Logging for Discarded Comments ---
+            core.info(`❌ DISCARDING COMMENT for ${filePath} line ${lineNumber} (Not an added line in chunk)`); // Use info level
+            core.debug(`   AI Response: ${JSON.stringify(aiResponse)}`);
+            core.debug(`   Added Lines in Chunk: ${JSON.stringify(Array.from(addedLineNumbersInChunk))}`);
+            // --- END Enhanced Logging for Discarded Comments ---
             return []; // Discard comment
         }
         // --- End Check ---
@@ -449,7 +473,11 @@ async function createReviewComment(
     core.info("No valid comments to post after validation.");
     return;
   }
-  core.info(`Posting ${comments.length} validated comments to PR #${pull_number}...`);
+
+  // Log the comments that are about to be posted
+  core.info(`Attempting to post ${comments.length} validated comments to PR #${pull_number}...`);
+  core.debug(`Comments to be posted: ${JSON.stringify(comments, null, 2)}`); // Pretty print for debug
+
   try {
     await octokit.pulls.createReview({
       owner,
@@ -459,15 +487,15 @@ async function createReviewComment(
       event: "COMMENT",
     });
     core.info("Successfully posted review comments.");
-  } catch (error) {
+  } catch (error: any) { // Catch as 'any' or 'unknown' then check type
     core.error(`Failed to create review comments: ${error}`);
-     // Log the error response details if available, especially for 422 errors
-    if (error instanceof Error && 'response' in error) {
-      const responseError = error as any; // Cast to access response potentially
-      core.error(`API Response Status: ${responseError.status}`);
-      if (responseError.response?.data) {
-         core.error(`API Response Data: ${JSON.stringify(responseError.response.data)}`);
-      }
+    // Log the error response details if available, especially for 422 errors
+    if (error && typeof error === 'object' && 'status' in error) {
+      core.error(`API Response Status: ${error.status}`);
+       // Attempt to access response data if it exists (common with Octokit errors)
+       if ('response' in error && error.response && typeof error.response === 'object' && 'data' in error.response) {
+          core.error(`API Response Data: ${JSON.stringify(error.response.data)}`);
+       }
     }
     // Also log the comments it tried to post for debugging
     core.error(`Failed comments data (first 5): ${JSON.stringify(comments.slice(0, 5), null, 2)}`);
@@ -495,13 +523,13 @@ async function main() {
     }
 
     // Parse the diff
+    core.debug(`Raw Diff Content (first 500 chars):\n ${diff.substring(0,500)}`);
     const parsedDiff = parseDiff(diff);
 
-    // Filter out excluded files BEFORE analysis (moved filtering logic to analyzeCode)
     core.info(`Found ${parsedDiff.length} files in diff.`);
 
     // Analyze the code (validation happens inside createComment)
-    const comments = await analyzeCode(parsedDiff, prDetails); // Filtering now happens inside analyzeCode
+    const comments = await analyzeCode(parsedDiff, prDetails);
 
     // Create the review comment on GitHub
     await createReviewComment(
